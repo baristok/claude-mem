@@ -83,9 +83,17 @@ export const contextHandler: EventHandler = {
     const normalizedPlatformSource = input.platform
       ? normalizePlatformSource(input.platform)
       : undefined;
-    const platformSourceParam = input.platform
-      ? `&platformSource=${encodeURIComponent(normalizedPlatformSource!)}`
-      : '';
+    // Shared-memory mode: when CLAUDE_MEM_CONTEXT_SHARE_ALL_PLATFORMS=true in
+    // ~/.claude-mem/settings.json, omit the platformSource param so context
+    // injection spans every platform's observations (OMP, Cursor, ...) in the
+    // shared DB — the SQL then takes its `(? IS NULL OR ...)` all-platforms
+    // branch. Default keeps the per-platform scoping.
+    const shareAllPlatforms = settings.CLAUDE_MEM_CONTEXT_SHARE_ALL_PLATFORMS === 'true';
+    const platformSourceParam = shareAllPlatforms
+      ? ''
+      : (input.platform
+        ? `&platformSource=${encodeURIComponent(normalizedPlatformSource!)}`
+        : '');
     const apiPath = `/api/context/inject?projects=${encodeURIComponent(projectsParam)}${platformSourceParam}`;
     const colorApiPath = input.platform === 'claude-code' ? `${apiPath}&colors=true` : apiPath;
 
