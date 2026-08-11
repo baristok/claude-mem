@@ -3,25 +3,23 @@
 
 Idempotent — safe to run repeatedly. Usage:
 
-    python3 scripts/apply-shared-memory.py [--workspace /path/to/ws ...]
+    python3 scripts/apply-shared-memory.py
 
-What it restores:
+What it restores (Claude Code / OMP / Cursor all read one shared memory):
 
   1. Patches scripts/worker-service.cjs in the plugin cache AND marketplace
      copies so the SessionStart context request omits `platformSource` when
-     CLAUDE_MEM_CONTEXT_SHARE_ALL_PLATFORMS=true  (shared memory across
-     Claude Code / OMP / Cursor / Codex).
-  2. Ensures the flag is set in:
+     CLAUDE_MEM_CONTEXT_SHARE_ALL_PLATFORMS=true.
+  2. Patches the Cursor adapter's formatOutput so the context handler's
+     additionalContext is emitted as Cursor's sessionStart `additional_context`
+     (Cursor cannot inject via beforeSubmitPrompt; sessionStart is its only
+     injection path).
+  3. Registers a `sessionStart` hook in ~/.cursor/hooks.json that runs
+     `hook cursor context`, and removes the old rules-file approach
+     (.cursor/rules/claude-mem-context.mdc + cursor-projects.json) if present.
+  4. Ensures the flag is set in:
        ~/.claude-mem/settings.json      (read by every platform's hooks)
        ~/.claude/settings.json env       (Claude Code hook processes)
-  3. (Re)creates Cursor context rules files (.cursor/rules/claude-mem-context.mdc)
-     for each workspace and registers them in ~/.claude-mem/cursor-projects.json,
-     so Cursor receives the shared context via rules files — Cursor's
-     beforeSubmitPrompt hook cannot modify the prompt, so this is the only
-     injection path for Cursor.
-
-Default workspaces: /tmp and ~/Desktop/maltpanel. Pass --workspace to add
-more. Existing registry entries are preserved.
 """
 
 import argparse
@@ -29,20 +27,20 @@ import glob
 import json
 import os
 import sys
-import urllib.request
-import urllib.parse
 
 HOME = os.path.expanduser("~")
 DATA_DIR = os.environ.get("CLAUDE_MEM_DATA_DIR", os.path.join(HOME, ".claude-mem"))
 SETTINGS = os.path.join(DATA_DIR, "settings.json")
 CC_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
-REGISTRY = os.path.join(DATA_DIR, "cursor-projects.json")
-MARKETPLACE = os.path.join(
+CURSOR_HOOKS = os.path.join(HOME, ".cursor", "hooks.json")
+CURSOR_REGISTRY = os.path.join(DATA_DIR, "cursor-projects.json")
+MARKETPLACE_WS = os.path.join(
     HOME, ".claude", "plugins", "marketplaces", "thedotmack", "plugin", "scripts", "worker-service.cjs"
 )
 CACHE_GLOB = os.path.join(
     HOME, ".claude", "plugins", "cache", "thedotmack", "claude-mem", "*", "scripts", "worker-service.cjs"
 )
+BUN = os.environ.get("BUN", os.path.join(HOME, ".bun", "bin", "bun"))
 
 FLAG = "CLAUDE_MEM_CONTEXT_SHARE_ALL_PLATFORMS"
 
@@ -53,20 +51,28 @@ GATE_NEW = ('c=(di().CLAUDE_MEM_CONTEXT_SHARE_ALL_PLATFORMS==="true"||'
             't.platform?`&platformSource=${encodeURIComponent(a)}`:"",')
 DEF_OLD = 'CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT:"true",CLAUDE_MEM_WELCOME_HINT_ENABLED:"true",'
 DEF_NEW = 'CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT:"true",CLAUDE_MEM_CONTEXT_SHARE_ALL_PLATFORMS:"false",CLAUDE_MEM_WELCOME_HINT_ENABLED:"true",'
+CURSOR_FO_OLD = "edits:e.edits}},formatOutput(t){return{continue:t.continue??!0}}"
+CURSOR_FO_NEW = ("edits:e.edits}},formatOutput(t){let e=t.hookSpecificOutput?.additionalContext;"
+                 "return e?{continue:!0,additional_context:e}:{continue:t.continue??!0}}")
+
+PATCHES = [
+    (GATE_OLD, GATE_NEW, "platformSource gate"),
+    (DEF_OLD, DEF_NEW, "DEFAULTS entry"),
+    (CURSOR_FO_OLD, CURSOR_FO_NEW, "cursor additional_context passthrough"),
+]
 
 
 def patch_bundle(path):
-    """Apply both needle edits to a bundle; returns list of applied/reason strings."""
+    """Apply all needle edits to a bundle; returns list of applied/reason strings."""
     if not os.path.exists(path):
         return [f"skip (not found): {path}"]
     src = open(path).read()
     out = []
-    for old, new, label in ((GATE_OLD, GATE_NEW, "gate"), (DEF_OLD, DEF_NEW, "defaults")):
+    for old, new, label in PATCHES:
         n = src.count(old)
         if new in src:
             out.append(f"ok (already patched): {label}")
         elif n == 1:
-            open(path, "w").write(src.replace(old, new))
             src = src.replace(old, new)
             out.append(f"patched: {label}")
         elif n == 0:
@@ -74,6 +80,7 @@ def patch_bundle(path):
         else:
             out.append(f"WARN: {label} needle found {n}x — aborting this file")
             break
+    open(path, "w").write(src)
     return out
 
 
@@ -89,75 +96,46 @@ def ensure_flag(path, nested_env=False):
     return [f"{'set' if changed else 'ok (already set)'}: {FLAG}=true in {path}"]
 
 
-def worker_port():
-    return int(os.environ.get("CLAUDE_MEM_WORKER_PORT", 37700))
-
-
-def fetch_context(project):
-    url = f"http://127.0.0.1:{worker_port()}/api/context/inject?project={urllib.parse.quote(project)}"
-    with urllib.request.urlopen(url, timeout=15) as r:
-        return r.read().decode()
-
-
-def write_cursor_context(workspace, project, context):
-    rules_dir = os.path.join(workspace, ".cursor", "rules")
-    os.makedirs(rules_dir, exist_ok=True)
-    content = (
-        "---\n"
-        'alwaysApply: true\n'
-        'description: "Claude-mem context from past sessions (auto-updated)"\n'
-        "---\n\n"
-        "# Memory Context from Past Sessions\n\n"
-        "The following context is from claude-mem, a persistent memory system "
-        "that tracks your coding sessions.\n\n"
-        f"{context}\n"
-        "---\n"
-        "*Updated after last session. Use claude-mem's MCP search tools for more detailed queries.*\n"
-    )
-    path = os.path.join(rules_dir, "claude-mem-context.mdc")
-    open(path, "w").write(content)
-    return path
-
-
-def register_cursor(workspaces):
-    reg = {}
-    if os.path.exists(REGISTRY):
-        reg = json.load(open(REGISTRY))
+def ensure_cursor_sessionstart():
+    """Register the sessionStart hook in ~/.cursor/hooks.json; drop rules approach."""
     out = []
-    for ws in workspaces:
-        ws = os.path.expanduser(ws)
-        if not os.path.isdir(ws):
-            out.append(f"WARN: workspace not a dir, skipping: {ws}")
-            continue
-        project = os.path.basename(os.path.normpath(ws))
-        try:
-            ctx = fetch_context(project)
-        except Exception as e:  # worker down — still register, skip file
-            out.append(f"WARN: worker unreachable for '{project}': {e}")
-            continue
-        path = write_cursor_context(ws, project, ctx)
-        reg.setdefault(project, {"workspacePath": ws, "installedAt": "2026-08-12T00:00:00.000Z"})
-        out.append(f"ok: {path} ({len(ctx)} chars, project='{project}')")
-    json.dump(reg, open(REGISTRY, "w"), indent=2)
-    out.append(f"registry: {REGISTRY} -> {sorted(reg)}")
+    if not os.path.exists(MARKETPLACE_WS):
+        out.append("WARN: marketplace worker-service.cjs not found — cannot wire sessionStart hook")
+        return out
+
+    cmd = f'"{BUN}" "{MARKETPLACE_WS}" hook cursor context'
+    hooks = {}
+    if os.path.exists(CURSOR_HOOKS):
+        hooks = json.load(open(CURSOR_HOOKS))
+
+    existing = (hooks.get("hooks") or {}).get("sessionStart") or []
+    if any(e.get("command") == cmd for e in existing):
+        out.append("ok (already registered): sessionStart hook in ~/.cursor/hooks.json")
+    else:
+        hooks.setdefault("hooks", {}).setdefault("sessionStart", []).append({"command": cmd})
+        json.dump(hooks, open(CURSOR_HOOKS, "w"), indent=2)
+        out.append("registered: sessionStart -> `hook cursor context` in ~/.cursor/hooks.json")
+
+    # remove the abandoned rules-file approach if present
+    for f in (CURSOR_REGISTRY,):
+        if os.path.exists(f):
+            os.remove(f)
+            out.append(f"removed (rules approach abandoned): {f}")
     return out
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--workspace", action="append", default=[])
-    args = ap.parse_args()
+    ap.parse_args()
 
-    workspaces = args.workspace or ["/tmp", os.path.join(HOME, "Desktop", "maltpanel")]
     results = []
-
-    bundles = sorted(glob.glob(CACHE_GLOB)) + [MARKETPLACE]
+    bundles = sorted(glob.glob(CACHE_GLOB)) + [MARKETPLACE_WS]
     for b in bundles:
         results.extend(patch_bundle(b))
 
     results.extend(ensure_flag(SETTINGS, nested_env=False))
     results.extend(ensure_flag(CC_SETTINGS, nested_env=True))
-    results.extend(register_cursor(workspaces))
+    results.extend(ensure_cursor_sessionstart())
 
     print("\n".join(results))
     ok = not any(r.startswith("WARN") for r in results)

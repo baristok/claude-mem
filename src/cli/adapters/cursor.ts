@@ -52,6 +52,15 @@ export const cursorAdapter: PlatformAdapter = {
     };
   },
   formatOutput(result) {
+    // Cursor's sessionStart hook accepts `additional_context` (added to the
+    // conversation's initial system context) — the only Cursor path that
+    // injects context the way Claude Code's SessionStart does. Pass the
+    // context handler's additionalContext through; other events keep the
+    // plain continue result.
+    const additionalContext = result.hookSpecificOutput?.additionalContext;
+    if (additionalContext) {
+      return { continue: true, additional_context: additionalContext };
+    }
     return { continue: result.continue ?? true };
   }
 };
